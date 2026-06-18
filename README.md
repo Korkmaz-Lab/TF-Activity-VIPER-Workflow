@@ -8,7 +8,7 @@ A methods reference for inferring transcription factor (TF) activity from bulk R
 
 ## Overview
 
-Gene expression levels alone do not tell you which transcription factors are driving a phenotype. A TF can be active without changing its own mRNA level, and conversely a highly expressed TF may be inhibited post-translationally. VIPER addresses this by treating each TF's regulon (the set of genes it controls) as a molecular readout of TF activity — if a TF's downstream targets are coordinately up- or downregulated, the TF is inferred to be active or suppressed.
+Gene expression levels alone do not tell which transcription factors are driving a phenotype. A TF can be active without changing its own mRNA level, and conversely a highly expressed TF may be inhibited post-translationally. VIPER addresses this by treating each TF's regulon (the set of genes it controls) as a molecular readout of TF activity — if a TF's downstream targets are coordinately up- or downregulated, the TF is inferred to be active or suppressed.
 
 This workflow has two stages:
 
