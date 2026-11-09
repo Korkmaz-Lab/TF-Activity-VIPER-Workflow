@@ -1,176 +1,170 @@
 # TF-Activity-VIPER-Workflow
 
-# ARACNe + VIPER: Transcription Factor Activity Inference
-
-A methods reference for inferring transcription factor (TF) activity from bulk RNA-seq using network-based approaches. This covers two complementary strategies: **ARACNe-AP** (data-driven regulon inference) and **DoRothEA** (curated regulon), both evaluated through **VIPER**.
+A short lab quick-reference for inferring transcription factor (TF) activity from bulk RNA-seq with **VIPER**, using regulons from either **ARACNe-AP** (data-driven) or **DoRothEA** (curated). It is not a full tutorial: for details see the original papers and the package documentation (references below). What this page tries to get right is the choice of options and the places where the defaults are not what we use.
 
 ---
 
 ## Overview
 
-Gene expression levels alone do not tell which transcription factors are driving a phenotype. A TF can be active without changing its own mRNA level, and conversely a highly expressed TF may be inhibited post-translationally. VIPER addresses this by treating each TF's regulon (the set of genes it controls) as a molecular readout of TF activity — if a TF's downstream targets are coordinately up- or downregulated, the TF is inferred to be active or suppressed.
-
-This workflow has two stages:
-
-1. **Build the regulon** — either from a co-expression network (ARACNe) or from a curated database (DoRothEA)
-2. **Run VIPER** — score TF activity per sample against a gene expression signature
-
----
-
-## Workflow
+Expression of a TF does not tell whether the TF is active. VIPER treats a TF's regulon (the genes it controls) as a readout of its activity: if the targets are coordinately up- or down-regulated in a sample (or a contrast), the TF is inferred to be active or suppressed.
 
 ```
 RNA-seq expression matrix
         │
-        ├──► ARACNe-AP ──► data-driven regulon (.txt)
-        │                         │
-        └──► DoRothEA  ──► curated regulon (R package)
-                                  │
-                             aracne2regulon()
-                                  │
-                              viper() / msviper()
-                                  │
-                    ┌─────────────┴─────────────┐
-              per-sample TF               master regulator
-              activity matrix (NES)       analysis (msviper NES)
+        ├──► ARACNe-AP ──► network.txt ──► aracne2regulon() ──► pruneRegulon() ─┐
+        │                                                                        ├──► regulon
+        └──► DoRothEA / CollecTRI (curated) ──► df2regulon() ───────────────────┘
+                                                                                 │
+                                                          viper() / msviper()
+                                                                 │
+                                         ┌───────────────────────┴──────────────────┐
+                                  per-sample activity                   master regulators (MR)
+                                  matrix (NES)                          between two groups (NES)
 ```
+
+**Which regulon?**
+
+| | ARACNe-AP (Option A) | DoRothEA / CollecTRI (Option B) |
+|---|---|---|
+| Source | Inferred from your own cohort | Curated (literature, ChIP-seq, ...) |
+| Needs | A homogeneous cohort, typically ≥ 100 samples, and an HPC for the bootstraps | Nothing but the R package |
+| Strength | Context-specific; covers many regulators (TFs, co-TFs, ...) | Quick; well-characterised TFs; context-agnostic |
+| Weakness | Depends on the training cohort; costly to run | Few targets per TF, so small `minsize`; not tissue-specific |
+
+Running both is a useful cross-check; where they disagree, look at the tissue match of the network first.
+
+## Quick start (runs without private data)
+
+[`scripts/example_bcellviper.R`](scripts/example_bcellviper.R) runs the whole chain on the public `bcellViper` data: network file → `aracne2regulon` → `pruneRegulon` → `viper` → `msviper` + `shadow` → a target-shuffled null. The "network" in it is synthetic (written from the regulon shipped with `bcellViper`) because a real ARACNe-AP run needs hundreds of samples; swap in your own `network.txt` and expression matrix.
+
+```bash
+Rscript scripts/example_bcellviper.R example_out
+```
+
+(`viper` prints some `number of iterations=` lines while it fits the regulon; this is harmless.)
 
 ---
 
-## Stage 1 — Regulon Construction
+## Stage 1: regulon
 
-### Option A: ARACNe-AP (data-driven)
+### Option A: ARACNe-AP
 
-ARACNe-AP infers a gene regulatory network from a large expression dataset using mutual information and data processing inequality (DPI) to retain only direct interactions.
+ARACNe-AP infers a network from a large expression matrix with mutual information (MI) and the data processing inequality (DPI). Run it as a command-line Java tool: three steps (MI threshold, 100 bootstraps as a job array, consolidation). Notes on Java 8 / Singularity and SLURM templates are in [`docs/aracne_ap_hpc.md`](docs/aracne_ap_hpc.md).
 
-**Requirements:** A large, homogeneous expression cohort (typically n ≥ 100 samples). TCGA disease-specific matrices are a common choice.
+> *Example (our earlier TCGA-BRCA analysis; VST-normalised, 1,113 tumour and 113 normal samples, separate networks):* the tumour network had 267,016 edges over 1,471 regulators and the normal network 223,545 edges over 1,460 regulators.
 
-> *Example:* We used TCGA BRCA VST-normalized expression (1,226 samples) to infer separate tumor and normal networks. The tumor network contained ~267,000 interactions across 1,471 TFs; the normal network ~224,000 interactions across 1,460 TFs.
-
-ARACNe-AP is run as a command-line Java tool (see [ARACNe-AP GitHub](https://github.com/califano-lab/ARACNe-AP)). The output is a tab-delimited network file.
-
-Loading the network in R:
+The output `network.txt` has a **header and four columns** (`Regulator`, `Target`, `MI`, `pvalue`). `aracne2regulon(format = "3col")` reads every line and takes the first three columns, so **the header and the p-value column must be removed first**; passing `network.txt` directly fails.
 
 ```r
 library(viper)
 
-regulon <- aracne2regulon(
-  afile   = "tumor_network.txt",
-  eset    = tcga_expr_matrix,   # used to estimate mode of regulation
-  format  = "3col"
-)
+net <- read.delim("network.txt")                                   # Regulator, Target, MI, pvalue
+write.table(net[, c("Regulator", "Target", "MI")], "network_3col.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# expr: gene x sample matrix (gene symbols as rownames) = the matrix the network was built from
+regulon <- aracne2regulon("network_3col.txt", expr, format = "3col", verbose = FALSE)
+regulon <- pruneRegulon(regulon, cutoff = 50, adaptive = FALSE)    # see the parameter table
+saveRDS(regulon, "regulon.rds")
 ```
 
-The expression matrix passed to `aracne2regulon()` is used solely to determine the sign (activation vs. repression) of each edge — it does not need to be the same dataset you will later run VIPER on.
+`expr` is used to set the **mode of regulation** (sign of the regulator-target correlation in that matrix) and must contain all regulators and targets; use the network's own input matrix. The MI gives the weight.
 
-### Option B: DoRothEA (curated)
+### Option B: DoRothEA / CollecTRI (curated)
 
-DoRothEA provides a literature- and ChIP-seq-curated regulon for ~500 TFs, stratified by confidence (A–E). Confidence levels A and B are recommended for most analyses.
+DoRothEA is a curated regulon with confidence levels A–E. In `dorothea` 1.22.0 it holds 1,333 TFs over all levels; levels A+B (recommended for most analyses) have 118 TFs and 6,408 interactions. These are small regulons (median 20.5 targets at A+B), so the default `minsize = 25` would drop 66 of the 118 TFs (52 pass); use a small `minsize` (5 here, all 118 pass). CollecTRI (via `decoupleR`) is a larger curated collection; the lab project uses `minsize = 5` for it.
 
 ```r
 library(dorothea)
+library(dplyr)          # for filter(); without it stats::filter is called and fails
 library(viper)
 
-regulon <- df2regulon(
-  filter(dorothea_hs, confidence %in% c("A", "B"))
-)
+regulon <- df2regulon(filter(dorothea_hs, confidence %in% c("A", "B")))
+# later: viper(sig, regulon, ..., minsize = 5)
 ```
-
-DoRothEA is smaller (A+B: ~118 TFs) but higher precision. It works well when the biological question involves well-characterised TFs and you do not have a tissue-matched expression dataset for ARACNe.
 
 ---
 
-## Stage 2 — VIPER
+## Stage 2: VIPER
 
-### Per-sample TF activity
+### Per-sample activity: `viper()`
 
-`viper()` scores TF activity for each sample in an expression matrix. The output is a TF × sample matrix of normalized enrichment scores (NES), where positive NES = TF is active, negative NES = TF is suppressed.
+Output: regulator × sample matrix of NES (positive = inferred active, negative = suppressed). It can be used for clustering, differential activity, or as features in a classifier.
 
 ```r
-tf_activity <- viper(
-  eset    = query_expr_matrix,   # genes × samples
-  regulon = regulon,
-  nes.method = "none",
-  method  = "scale",
-  minsize = 4,
-  verbose = FALSE
-)
+# sig: gene x sample signature; regulon: from Stage 1
+activity <- viper(sig, regulon, method = "none", minsize = 25,
+                  eset.filter = FALSE, verbose = FALSE)
 ```
 
-The resulting matrix can be used as features for classification, clustering, or differential activity testing, in place of or alongside raw gene expression.
+- `method` sets how the input is standardised. `"none"` (default) assumes the signature is already standardised, e.g. a z-score of each sample against a reference cohort (what we do). For a raw expression matrix use `"scale"`.
+- There is no `nes.method` argument (the earlier README used one and the call fails with `unused argument`). `nes` (logical, default `TRUE`) is the real one.
+- `minsize`: default 25 (use this for ARACNe regulons); small for curated regulons (Option B).
+- `eset.filter = FALSE` is **not** the default (`TRUE`): each sample is ranked over all measured genes instead of only the regulon genes.
 
-### Master regulator analysis
-
-`msviper()` tests which TFs best explain a gene expression signature — for example, the differential expression results from a 2D vs. 3D comparison, or a disease vs. normal contrast.
+### Master regulators between groups: `msviper()`
 
 ```r
-# Build a gene expression signature (e.g. from DESeq2 results)
-signature <- rowTtest(
-  x = expr_condition_A,
-  y = expr_condition_B
-)
+# groupA, groupB: gene x sample matrices (e.g. columns of expr)
+tt   <- rowTtest(groupA, groupB)
+ges  <- (qnorm(tt$p.value / 2, lower.tail = FALSE) * sign(tt$statistic))[, 1]   # NAMED numeric vector
+null <- ttestNull(groupA, groupB, per = 1000, repos = TRUE)                     # sample permutations
 
-# Run msviper
-mrs <- msviper(
-  ges     = signature,
-  regulon = regulon,
-  minsize = 4,
-  verbose = FALSE
-)
-
-summary(mrs, mrs = 20)   # top 20 master regulators
+mrs <- msviper(ges, regulon, null, minsize = 25)
+summary(mrs, mrs = 20)                       # top 20 regulators
+mrs <- shadow(mrs, regulators = 25)          # flags MRs whose enrichment overlaps another MR's
 ```
 
-The output gives each TF a NES and p-value representing how coherently its regulon is enriched at the top or bottom of the expression signature.
+`msviper()` needs a named numeric vector for `ges`, not the list returned by `rowTtest()`. Without the null model the p-values are not sample-permutation based and NES are strongly inflated when there are few samples. After `shadow()`, `summary()` returns a list (`$msviper.results`, `$Shadow.pairs`).
 
----
+## Parameters
 
-## DoRothEA as Complementary Evidence
+Package defaults come from viper 1.44.0. **Non-default** values are deliberate choices.
 
-A practical use of running both is cross-validation: findings that appear in both the data-driven ARACNe network (built from an independent cohort) and the curated DoRothEA regulon are more likely to reflect real regulatory biology rather than network inference artefacts.
+| Parameter | Value used here | Default? | Why |
+|---|---|---|---|
+| ARACNe-AP MI p-value | `1E-8` | yes | |
+| ARACNe-AP DPI tolerance | `0` | yes | |
+| ARACNe-AP consolidation | Bonferroni | yes | |
+| ARACNe-AP bootstraps | 100 (seeds 1-100) | no (common practice) | stable consolidated network |
+| `pruneRegulon(cutoff)` | 50 | yes | |
+| `pruneRegulon(adaptive)` | `FALSE` | **no** (default `TRUE`) | keeps exactly the 50 strongest targets by MI; `TRUE` keeps more. Check sensitivity with `cutoff = 100`. |
+| `viper(minsize)` | 25 (ARACNe); 5 (DoRothEA / CollecTRI) | 25 | small curated regulons |
+| `viper(eset.filter)` | `FALSE` | **no** (default `TRUE`) | rank each sample over all measured genes |
+| `viper(method)` | `"none"` with a pre-standardised signature | yes | use `"scale"` for raw expression |
+| `msviper` null | 1000 sample permutations | no (null optional) | permutation p-values |
 
-Differences between the two are also informative. ARACNe networks are tissue- and context-specific, so TFs that are strong master regulators in one tissue context may drop out when the network is inferred from a different one. DoRothEA, being context-agnostic, can recover these when the tissue match is poor.
+## Controls
 
----
+Activity scores are indirect. Before interpreting a master-regulator list:
 
-## Output Interpretation
+1. **Positive controls**, written down before looking at results (e.g. in breast: ESR1, FOXA1, GATA3 higher in luminal than basal). If they do not separate in the expected direction, check network, regulon and signature and do not interpret the list.
+2. **Target-shuffled null:** permute the gene labels of the regulon targets (one permutation for all regulons, fixed seed, repeated e.g. 100 times) and score again; real activities should be clearly more structured than shuffled ones. A short version is in the example script.
+3. **Sensitivity:** `pruneRegulon(cutoff = 50)` versus `100`; and `eset.filter` `FALSE` versus `TRUE` (correlation of activities per regulator).
+4. **Baseline:** compare with a pre-built or curated regulon scored on the same signature, and with the regulator's own mRNA level.
 
-| Output | Interpretation |
-|---|---|
-| `viper()` NES > 0 | TF is inferred active in that sample |
-| `viper()` NES < 0 | TF is inferred suppressed |
-| `msviper()` NES > 0 | TF drives the upregulated end of the signature |
-| `msviper()` NES < 0 | TF drives the downregulated end |
-| Large \|NES\|, small p-value | Strong, coherent regulon enrichment |
+## Files
 
-NES from `viper()` can be used directly as feature matrices for machine learning classifiers (replacing or supplementing gene-level features). NES from `msviper()` identifies which TFs are most mechanistically relevant to the phenotype contrast being studied.
-
----
-
-## Key Parameters
-
-| Parameter | Function | Notes |
-|---|---|---|
-| `minsize` | Minimum regulon size to test | 4–15 typical; smaller = more TFs tested, more noise |
-| `confidence` (DoRothEA) | A–E confidence tiers | A+B recommended; C adds coverage at lower precision |
-| DPI tolerance (ARACNe) | Edge pruning stringency | Default 0 is conservative; relax for sparse networks |
-
----
+Suggested names: `network.txt` (consolidated ARACNe-AP output), `regulon.rds` (pruned regulon), `activity.rds` (regulator × sample NES), `mr_<comparison>.tsv` (all tested regulators: NES, p, FDR, regulon size). Keep the parameters you used (and the `sessionInfo()`) next to the results.
 
 ## Dependencies
 
-```r
-# Bioconductor
-BiocManager::install(c("viper", "dorothea"))
+Tested with R 4.5.2 and Bioconductor 3.22: `viper` 1.44.0, `bcellViper` 1.46.0, `dorothea` 1.22.0, `decoupleR` 2.16.0, `dplyr` 1.2.1. (Bioconductor 3.23, R 4.6, ships `viper` 1.46.0 and `bcellViper` 1.48.0; not tested here.)
 
-# ARACNe-AP: Java tool, separate installation
-# https://github.com/califano-lab/ARACNe-AP
+```r
+install.packages("BiocManager")
+BiocManager::install(c("viper", "bcellViper", "dorothea", "dplyr"))   # decoupleR only for CollecTRI
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")           # record versions with the results
 ```
 
----
+ARACNe-AP is a separate Java tool: <https://github.com/califano-lab/ARACNe-AP> (Java 8; see [`docs/aracne_ap_hpc.md`](docs/aracne_ap_hpc.md)).
 
 ## References
 
-- Alvarez MJ et al. (2016). Functional characterization of somatic mutations in cancer using network-based inference of protein activity. *Nature Genetics*, 48(8), 838–847. [VIPER]
-- Badia-i-Mompel P et al. (2023). Gene regulatory network inference from scRNA-seq with DoRothEA. *Bioinformatics*. [DoRothEA]
-- Margolin AA et al. (2006). ARACNE: An algorithm for the reconstruction of gene regulatory networks in a mammalian cellular context. *BMC Bioinformatics*, 7(Suppl 1), S7. [ARACNe]
+- Alvarez MJ et al. (2016). Functional characterization of somatic mutations in cancer using network-based inference of protein activity. *Nat Genet* 48(8):838-847. doi:10.1038/ng.3593 [VIPER]
+- Lachmann A et al. (2016). ARACNe-AP: gene network reverse engineering through adaptive partitioning inference of mutual information. *Bioinformatics* 32(14):2233-2235. doi:10.1093/bioinformatics/btw216 [ARACNe-AP]
+- Margolin AA et al. (2006). ARACNE: an algorithm for the reconstruction of gene regulatory networks in a mammalian cellular context. *BMC Bioinformatics* 7(Suppl 1):S7. doi:10.1186/1471-2105-7-S1-S7 [ARACNE]
+- Garcia-Alonso L et al. (2019). Benchmark and integration of resources for the estimation of human transcription factor activities. *Genome Res* 29(8):1363-1375. doi:10.1101/gr.240663.118 [DoRothEA]
+- Badia-I-Mompel P et al. (2022). decoupleR: ensemble of computational methods to infer biological activities from omics data. *Bioinform Adv* 2(1):vbac016. doi:10.1093/bioadv/vbac016 [decoupleR]
+- Müller-Dott S et al. (2023). Expanding the coverage of regulons from high-confidence prior knowledge for accurate estimation of transcription factor activities. *Nucleic Acids Res* 51(20):10934-10949. doi:10.1093/nar/gkad841 [CollecTRI]
+- Ding H et al. (2018). Quantitative assessment of protein activity in orphan tissues and single cells using the metaVIPER algorithm. *Nat Commun* 9:1471. doi:10.1038/s41467-018-03843-3 [metaVIPER]
